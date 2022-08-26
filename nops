@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+
+import argparse
+import importlib
+import logging
+import pkgutil
+import re
+import sys
+
+from lib.pinproxy import parse_pinmap, ThePinProxy
+from lib.progressbar import ProgressBar
+import lib.targetop
+
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_FILE_FORMAT = "inhx32"
+DEFAULT_FILE_FORMAT = "hexd"
+LEVELS = [logging.ERROR, logging.INFO, logging.WARNING, logging.DEBUG]
+RE_AVPS = r'(?P<key>\w+)' r'\s*(?P<eq>=\s*' r'(?P<value>\w+)|)'
+
+
+def main(args):
+    parsed_args = parse_args(args)
+    init_root_logger(parsed_args.verbose)
+    logger.debug(f"Arguments: {parsed_args}")
+    return operate(parsed_args)
+
+
+def parse_args(args):
+    p = argparse.ArgumentParser()
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("-q", "--no-progressbar", action="store_true")
+    loaders = [m.name for m in pkgutil.iter_modules(["lib/loader"])]
+    p.add_argument("-l", dest="loader", help="loader device (dummy)",
+                   choices=loaders, default="dummy")
+    p.add_argument("--la", dest="loader_args", action="extend", nargs="+",
+                   type=str, help="loader config")
+    p.add_argument("-t", dest="target", required=True, help="target operation")
+    p.add_argument("--ta", dest="target_args", action="extend", nargs="+",
+                   type=str, help="target operation")
+    p.add_argument("-p", dest="pinmap",
+                   action="extend", nargs="+", type=str, help="CS=1 DO=8 ...")
+    p.add_argument("-o", dest="out_file", default=sys.stdout,
+                   type=argparse.FileType('x'))
+    p.add_argument("-i", dest="in_file", default=sys.stdin,
+                   type=argparse.FileType('r'))
+    formatters = [m.name for m in pkgutil.iter_modules(["lib/file_format"])]
+    p.add_argument("-f", dest="file_format", choices=formatters,
+                   default=DEFAULT_FILE_FORMAT,
+                   help=f"default: {DEFAULT_FILE_FORMAT}")
+    return p.parse_args(args)
+
+
+def init_root_logger(verbosity=0):
+    verbosity = min(verbosity, len(LEVELS) - 1)
+    logging.basicConfig(
+        level=LEVELS[verbosity],
+        datefmt="%H:%M:%S",
+        format="[%(asctime)s.%(msecs)0.3d] %(message)s")
+
+
+def operate(args):
+    fmtobj = load_attribute(f"lib.file_format.{args.file_format}.FileFormat")()
+
+    target_args = parse_config_args(args.target_args)
+    logger.debug(f"targetop: {args.target} ({target_args})")
+    target = load_attribute(f"lib.target.{args.target}")
+    if not isinstance(target, lib.targetop.TargetOp):
+        raise TypeError("target must be decorated with @TargetOp")
+
+    loader_args = parse_config_args(args.loader_args)
+    logger.debug(f"loader: {args.loader} ({loader_args})")
+    loader_class = load_attribute(f"lib.loader.{args.loader}.Loader")
+    loader = loader_class(**loader_args)
+
+    pinmap = parse_pinmap(args.pinmap)
+    logger.debug(f"pinmap: {pinmap}")
+
+    mem_in = mem_out = None
+    with ThePinProxy(loader, pinmap) as pinproxy, args.in_file:
+        if target.does_need_input():
+            mem_in = fmtobj.deserialize(args.in_file)
+        progressbar = ProgressBar(muted=args.no_progressbar)
+        mem_out = target(pinproxy, progressbar, mem_in, **target_args)
+        progressbar.update(1)
+    if mem_out:
+        with args.out_file:
+            args.out_file.writelines(fmtobj.serialize(mem_out))
+
+
+def load_attribute(path):
+    modpath, attrib = path.rsplit(".", 1)
+    mod = importlib.import_module(modpath)
+    return getattr(mod, attrib)
+
+
+def parse_config_args(config_args):
+    result = {}
+    if not config_args:
+        return result
+    for m in config_args:
+        for k, eq, v in re.findall(RE_AVPS, m):
+            if not eq:
+                v = True
+            elif v.isdigit():
+                v = int(v)
+            result[k] = v
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
